@@ -66,6 +66,14 @@ async function getQwenCookie() {
   return cookie;
 }
 
+// NEW: Helper to get Gemini API Key from environment variables
+async function getGeminiApiKey() {
+  if (typeof GEMINI_API_KEY === 'undefined' || !GEMINI_API_KEY) {
+    throw new Error('Server configuration error: The GEMINI_API_KEY secret is not set in the Worker environment.');
+  }
+  return GEMINI_API_KEY;
+}
+
 // =================================================
 // 2. Main Request Handler
 // =================================================
@@ -94,7 +102,7 @@ async function handleRequest(request) {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-recognition-model, x-custom-prompt',
         },
       });
     }
@@ -171,27 +179,70 @@ async function handleRequest(request) {
 // 3. API Handlers
 // =================================================
 
+// MODIFIED: This function now routes to Qwen or Gemini based on a header
 async function handleImageUrlRecognition(request) {
+  const model = request.headers.get('x-recognition-model') || '0';
   const { imageUrl } = await request.json();
-  const cookie = await getQwenCookie();
   if (!imageUrl) return new Response(JSON.stringify({ error: 'Missing imageUrl' }), { status: 400 });
-  const tokenMatch = cookie.match(/token=([^;]+)/);
-  if (!tokenMatch) throw new Error('Invalid cookie format in KV: missing token');
-  const token = tokenMatch[1];
-  const imageResponse = await fetch(imageUrl);
-  const imageBlob = await imageResponse.blob();
-  const formData = new FormData();
-  formData.append('file', imageBlob);
-  const uploadResponse = await fetch('https://chat.qwenlm.ai/api/v1/files/', { method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${token}`, 'cookie': cookie }, body: formData });
-  const uploadData = await uploadResponse.json();
-  if (!uploadData.id) throw new Error('File upload to Qwen failed');
-  return await recognizeImage(token, uploadData.id, request);
+
+  let customPrompt = '';
+  try {
+    const encodedPrompt = request.headers.get('x-custom-prompt');
+    if (encodedPrompt) customPrompt = decodeURIComponent(atob(encodedPrompt));
+  } catch (e) {}
+
+  if (model === '1') { // Gemini
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) throw new Error(`Failed to fetch image from URL: ${imageResponse.statusText}`);
+    const imageBlob = await imageResponse.blob();
+    const buffer = await imageBlob.arrayBuffer();
+    // Convert buffer to base64
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    const base64 = btoa(binary);
+    
+    const defaultPrompt = 'Describe the image. If it is a math formula, output in LaTeX. If it is a captcha, output only the characters.';
+    const prompt = customPrompt || defaultPrompt;
+    const result = await recognizeWithGemini(base64, prompt);
+    return new Response(JSON.stringify({ success: true, result: result, type: 'text' }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+  } else { // Qwen (existing logic)
+    const cookie = await getQwenCookie();
+    const tokenMatch = cookie.match(/token=([^;]+)/);
+    if (!tokenMatch) throw new Error('Invalid cookie format in KV: missing token');
+    const token = tokenMatch[1];
+    const imageResponse = await fetch(imageUrl);
+    const imageBlob = await imageResponse.blob();
+    const formData = new FormData();
+    formData.append('file', imageBlob, 'image.png');
+    const uploadResponse = await fetch('https://chat.qwenlm.ai/api/v1/files/', { method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${token}`, 'cookie': cookie }, body: formData });
+    const uploadData = await uploadResponse.json();
+    if (!uploadData.id) throw new Error('File upload to Qwen failed: ' + (uploadData.message || JSON.stringify(uploadData)));
+    return await recognizeImage(token, uploadData.id, request);
+  }
 }
 
+// MODIFIED: This function now routes to Qwen or Gemini based on a header
 async function handleBase64Recognition(request) {
-    const { base64Image } = await request.json();
+  const model = request.headers.get('x-recognition-model') || '0';
+  const { base64Image } = await request.json();
+  if (!base64Image) return new Response(JSON.stringify({ error: 'Missing base64Image' }), { status: 400 });
+
+  let customPrompt = '';
+  try {
+    const encodedPrompt = request.headers.get('x-custom-prompt');
+    if (encodedPrompt) customPrompt = decodeURIComponent(atob(encodedPrompt));
+  } catch (e) {}
+
+  if (model === '1') { // Gemini
+    const defaultPrompt = 'Describe the image. If it is a math formula, output in LaTeX. If it is a captcha, output only the characters.';
+    const prompt = customPrompt || defaultPrompt;
+    const result = await recognizeWithGemini(base64Image, prompt);
+    return new Response(JSON.stringify({ success: true, result: result, type: 'text' }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+  } else { // Qwen (existing logic)
     const cookie = await getQwenCookie();
-    if (!base64Image) return new Response(JSON.stringify({ error: 'Missing base64Image' }), { status: 400 });
     const tokenMatch = cookie.match(/token=([^;]+)/);
     if (!tokenMatch) throw new Error('Invalid cookie format in KV: missing token');
     const token = tokenMatch[1];
@@ -199,11 +250,12 @@ async function handleBase64Recognition(request) {
     const response = await fetch(imageData);
     const blob = await response.blob();
     const formData = new FormData();
-    formData.append('file', blob);
+    formData.append('file', blob, 'image.png');
     const uploadResponse = await fetch('https://chat.qwenlm.ai/api/v1/files/', { method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${token}`, 'cookie': cookie }, body: formData });
     const uploadData = await uploadResponse.json();
-    if (!uploadData.id) throw new Error('File upload to Qwen failed');
+    if (!uploadData.id) throw new Error('File upload to Qwen failed: ' + (uploadData.message || JSON.stringify(uploadData)));
     return await recognizeImage(token, uploadData.id, request);
+  }
 }
 
 async function handleFileRecognition(request) {
@@ -223,6 +275,67 @@ async function handleProxyUpload(request) {
     const response = await fetch('https://chat.qwenlm.ai/api/v1/files/', { method: 'POST', headers: { 'accept': 'application/json', 'authorization': `Bearer ${token}`, 'cookie': cookie }, body: formData });
     const data = await response.json();
     return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+}
+
+// NEW: Gemini recognition function
+async function recognizeWithGemini(base64Image, prompt) {
+  const apiKey = await getGeminiApiKey();
+  const model = "gemini-2.5-flash"; // Use the standard model for vision
+  const apiUrl = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+  
+  const pureBase64 = base64Image.split(',')[1] || base64Image;
+
+  const requestBody = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inline_data: { mime_type: "image/png", data: pureBase64 } }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.1,
+      topK: 32,
+      topP: 1,
+      maxOutputTokens: 4096,
+    },
+     safetySettings: [ // Add safety settings to reduce blocking
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+    ]
+  };
+  
+  const response = await fetch(apiUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error("Gemini API Error:", errorBody);
+    throw new Error(`Gemini API request failed with status ${response.status}.`);
+  }
+
+  const responseData = await response.json();
+
+  if (responseData.candidates && responseData.candidates.length > 0) {
+    const candidate = responseData.candidates[0];
+    if (candidate.finishReason === "SAFETY") {
+        throw new Error("Gemini API Error: The response was blocked due to safety settings. Try a different image or prompt.");
+    }
+    if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+      return candidate.content.parts[0].text || "";
+    }
+  }
+  
+  // Check for prompt feedback if no candidates
+  if (responseData.promptFeedback && responseData.promptFeedback.blockReason) {
+    throw new Error(`Gemini API Error: The prompt was blocked due to ${responseData.promptFeedback.blockReason}.`);
+  }
+  
+  throw new Error("Gemini recognition failed: No valid content was returned from the API.");
 }
 
 async function recognizeImage(token, imageId, request) {
@@ -256,7 +369,7 @@ function getHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" type="image/png" href="data:image/png;base64,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">
+  <link rel="icon" type="image/png" href="data:image/png;base64,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">
   <title>Qwen VL 智能识别系统</title>
 
   <!-- MathJax 支持 -->
@@ -301,6 +414,12 @@ function getHTML() {
     h1::after { content: ""; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 100px; height: 3px; background: linear-gradient(90deg, transparent, #3498db, transparent); }
     .subtitle { color: #7f8c8d; text-align: center; font-size: 1.1rem; margin-bottom: 1.5rem; font-weight: 300; letter-spacing: 1px; opacity: 0.8; animation: subtitleFadeIn 1s ease-out 0.3s both; }
     @keyframes subtitleFadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 0.8; transform: translateY(0); } }
+    /* NEW: Styles for model selector */
+    .model-selector { display: flex; align-items: center; justify-content: center; margin-bottom: 1.5rem; gap: 15px; }
+    .model-label { font-size: 1rem; color: #2c3e50; font-weight: 500; }
+    .model-switch { display: flex; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; background: #e9ecef; }
+    .model-btn { background: transparent; border: none; padding: 10px 20px; cursor: pointer; transition: all 0.3s ease; font-size: 0.9rem; color: #555; font-weight: 500;}
+    .model-btn.active { background: #3498db; color: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 7px; }
     .upload-area { border: 2px dashed #8e9eab; border-radius: 12px; padding: 2rem; text-align: center; transition: all 0.3s ease; margin-bottom: 1.5rem; cursor: pointer; position: relative; overflow: hidden; }
     .upload-area:hover { border-color: #3498db; background: rgba(52, 152, 219, 0.05); }
     .upload-area.dragover { border-color: #3498db; background: rgba(52, 152, 219, 0.1); transform: scale(1.02); }
@@ -419,7 +538,17 @@ function getHTML() {
 
   <div class="container">
     <h1>Qwen VL 智能识别系统</h1>
-    <p class="subtitle">基于通义千问大模型的多模态智能识别引擎</p>
+    <p class="subtitle">基于通义千问/Gemini大模型的多模态智能识别引擎</p>
+    
+    <!-- NEW: Model Selector -->
+    <div class="model-selector">
+      <label class="model-label">选择模型:</label>
+      <div class="model-switch">
+        <button id="modelQwen" class="model-btn active">通义千问</button>
+        <button id="modelGemini" class="model-btn">Gemini</button>
+      </div>
+    </div>
+
     <div class="upload-area" id="uploadArea">
       <i>📸</i>
       <div class="upload-text">
@@ -488,8 +617,12 @@ function getHTML() {
         advancedMode: document.getElementById('advancedMode'),
         promptContainer: document.getElementById('promptContainer'),
         promptInput: document.getElementById('promptInput'),
+        // NEW: Model selector buttons
+        modelQwen: document.getElementById('modelQwen'),
+        modelGemini: document.getElementById('modelGemini'),
     };
     let currentToken = '';
+    let selectedModel = 'qwen'; // NEW: 'qwen' or 'gemini'
     
     class HistoryManager {
         constructor(maxHistory = 20) {
@@ -722,60 +855,157 @@ function getHTML() {
         } catch (error) { alert("保存失败: " + error.message); }
     }
     
+    // MODIFIED: Main image processing router
     async function processImage(data, type) {
-        if (!currentToken) { alert('请先在设置中保存您的Cookie。'); elements.sidebar.classList.add('open'); return; }
+        // Using Gemini requires a login (for history), but doesn't use the cookie itself.
+        // Qwen requires the cookie for API calls.
+        if (!currentToken) {
+            alert('请先在“Cookie设置”中保存一个有效的Cookie以启用历史记录等功能。');
+            elements.sidebar.classList.add('open');
+            return;
+        }
+
         elements.loading.style.display = 'block';
         elements.resultContainer.classList.remove('show');
-        let endpoint = '', body = {}, historyImage = '';
+        elements.previewImage.style.display = 'none';
 
         try {
-            if (type === "file") {
-                historyImage = await new Promise(resolve => { const r = new FileReader(); r.onload = e => resolve(e.target.result); r.readAsDataURL(data); });
-                elements.previewImage.src = historyImage;
-                const formData = new FormData();
-                formData.append('file', data);
-                const uploadRes = await fetch('/proxy/upload', { method: 'POST', body: formData });
-                const uploadData = await uploadRes.json();
-                if (!uploadData.id) throw new Error('文件上传失败: ' + (uploadData.error || JSON.stringify(uploadData)));
-                endpoint = '/recognize';
-                body = { imageId: uploadData.id };
-            } else if (type === "base64") {
-                endpoint = '/api/recognize/base64';
-                body = { base64Image: data };
-                historyImage = data.startsWith("data:") ? data : \`data:image/png;base64,\${data}\`;
-                elements.previewImage.src = historyImage;
-            } else if (type === "url") {
-                endpoint = '/api/recognize/url';
-                body = { imageUrl: data };
-                historyImage = data;
-                elements.previewImage.src = historyImage;
+            if (selectedModel === 'gemini') {
+                await processWithGemini(data, type);
+            } else {
+                await processWithQwen(data, type);
             }
-            elements.previewImage.style.display = 'block';
-
-            const res = await fetch(endpoint, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-advanced-mode': elements.advancedMode.checked,
-                    'x-custom-prompt': btoa(encodeURIComponent(elements.promptInput.value))
-                },
-                body: JSON.stringify(body)
-            });
-            const resData = await res.json();
-            if (!resData.success) throw new Error(resData.error || '识别失败');
-
-            const result = resData.result || '识别失败';
-            elements.resultDiv.setAttribute('data-original-text', result);
-            elements.resultDiv.innerHTML = result;
-            waitForMathJax(() => MathJax.typesetPromise([elements.resultDiv]).catch(console.error));
-            await historyManager.addHistory(currentToken, historyImage, result);
-            elements.resultContainer.classList.add('show');
         } catch (error) {
             elements.resultDiv.textContent = '处理失败: ' + error.message;
             elements.resultContainer.classList.add('show');
         } finally {
             elements.loading.style.display = 'none';
         }
+    }
+
+    // NEW: Logic for processing with Gemini
+    async function processWithGemini(data, type) {
+        let endpoint = '/api/recognize/base64';
+        let body = {};
+        let historyImage = '';
+
+        if (type === "file") {
+            const base64Image = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = e => resolve(e.target.result);
+                reader.onerror = e => reject(new Error('Failed to read file as Base64'));
+                reader.readAsDataURL(data);
+            });
+            body = { base64Image: base64Image.split(',')[1] };
+            historyImage = base64Image;
+        } else if (type === "url") {
+            endpoint = '/api/recognize/url';
+            body = { imageUrl: data };
+            historyImage = data; 
+        } else if (type === "base64") {
+            body = { base64Image: data };
+            historyImage = data.startsWith("data:") ? data : \`data:image/png;base64,\${data}\`;
+        } else {
+            throw new Error("Unsupported data type for Gemini");
+        }
+        
+        if (type !== "url") {
+            elements.previewImage.src = historyImage;
+            elements.previewImage.style.display = 'block';
+        }
+
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-recognition-model': '1', // Specify Gemini model
+                'x-advanced-mode': elements.advancedMode.checked,
+                'x-custom-prompt': btoa(encodeURIComponent(elements.promptInput.value))
+            },
+            body: JSON.stringify(body)
+        });
+
+        // MODIFIED: Robust error handling
+        if (!res.ok) {
+            const errorText = await res.text();
+            try {
+                const errorJson = JSON.parse(errorText);
+                throw new Error(errorJson.error || errorText);
+            } catch (jsonError) {
+                throw new Error(errorText || \`Request failed with status \${res.status}\`);
+            }
+        }
+        
+        const resData = await res.json();
+        if (!resData.success) throw new Error(resData.error || '识别失败');
+
+        const result = resData.result || '识别失败';
+        elements.resultDiv.setAttribute('data-original-text', result);
+        elements.resultDiv.innerHTML = result;
+        waitForMathJax(() => MathJax.typesetPromise([elements.resultDiv]).catch(console.error));
+        await historyManager.addHistory(currentToken, historyImage, result);
+        elements.resultContainer.classList.add('show');
+    }
+
+    // NEW: Logic for processing with Qwen (refactored from original function)
+    async function processWithQwen(data, type) {
+        let endpoint = '', body = {}, historyImage = '';
+
+        if (type === "file") {
+            historyImage = await new Promise(resolve => { const r = new FileReader(); r.onload = e => resolve(e.target.result); r.readAsDataURL(data); });
+            elements.previewImage.src = historyImage;
+            const formData = new FormData();
+            formData.append('file', data);
+            const uploadRes = await fetch('/proxy/upload', { method: 'POST', body: formData });
+            if (!uploadRes.ok) throw new Error('File upload proxy failed.');
+            const uploadData = await uploadRes.json();
+            if (!uploadData.id) throw new Error('文件上传失败: ' + (uploadData.error || JSON.stringify(uploadData)));
+            endpoint = '/recognize';
+            body = { imageId: uploadData.id };
+        } else if (type === "base64") {
+            endpoint = '/api/recognize/base64';
+            body = { base64Image: data };
+            historyImage = data.startsWith("data:") ? data : \`data:image/png;base64,\${data}\`;
+            elements.previewImage.src = historyImage;
+        } else if (type === "url") {
+            endpoint = '/api/recognize/url';
+            body = { imageUrl: data };
+            historyImage = data;
+            elements.previewImage.src = historyImage;
+        }
+        elements.previewImage.style.display = 'block';
+
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-recognition-model': '0', // Specify Qwen model
+                'x-advanced-mode': elements.advancedMode.checked,
+                'x-custom-prompt': btoa(encodeURIComponent(elements.promptInput.value))
+            },
+            body: JSON.stringify(body)
+        });
+        
+        // MODIFIED: Robust error handling
+        if (!res.ok) {
+            const errorText = await res.text();
+            try {
+                const errorJson = JSON.parse(errorText);
+                throw new Error(errorJson.error || errorText);
+            } catch (jsonError) {
+                throw new Error(errorText || \`Request failed with status \${res.status}\`);
+            }
+        }
+
+        const resData = await res.json();
+        if (!resData.success) throw new Error(resData.error || '识别失败');
+
+        const result = resData.result || '识别失败';
+        elements.resultDiv.setAttribute('data-original-text', result);
+        elements.resultDiv.innerHTML = result;
+        waitForMathJax(() => MathJax.typesetPromise([elements.resultDiv]).catch(console.error));
+        await historyManager.addHistory(currentToken, historyImage, result);
+        elements.resultContainer.classList.add('show');
     }
     
     // --- UI交互函数 ---
@@ -841,11 +1071,35 @@ function getHTML() {
     elements.toggleUrl.addEventListener('click', () => switchInputMode('url'));
     elements.toggleBase64.addEventListener('click', () => switchInputMode('base64'));
 
-    // 拖放、粘贴、点击上传
-    ['dragover', 'drop'].forEach(event => elements.uploadArea.addEventListener(event, e => e.preventDefault()));
-    elements.uploadArea.addEventListener('drop', e => {
-        if (elements.toggleFile.classList.contains('active')) processImage(e.dataTransfer.files[0], "file");
+    // NEW: Model switch listeners
+    elements.modelQwen.addEventListener('click', () => {
+        selectedModel = 'qwen';
+        elements.modelQwen.classList.add('active');
+        elements.modelGemini.classList.remove('active');
     });
+    elements.modelGemini.addEventListener('click', () => {
+        selectedModel = 'gemini';
+        elements.modelGemini.classList.add('active');
+        elements.modelQwen.classList.remove('active');
+    });
+
+    // 拖放、粘贴、点击上传
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(event => {
+        elements.uploadArea.addEventListener(event, e => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+    });
+    elements.uploadArea.addEventListener('dragenter', () => elements.uploadArea.classList.add('dragover'));
+    elements.uploadArea.addEventListener('dragleave', () => elements.uploadArea.classList.remove('dragover'));
+    elements.uploadArea.addEventListener('drop', e => {
+        elements.uploadArea.classList.remove('dragover');
+        if (elements.toggleFile.classList.contains('active')) {
+            const file = e.dataTransfer.files[0];
+            if (file) processImage(file, "file");
+        }
+    });
+
     document.addEventListener('paste', e => {
         if (elements.toggleFile.classList.contains('active')) {
             const file = e.clipboardData.files[0];
@@ -863,8 +1117,14 @@ function getHTML() {
     });
 
     // URL和Base64输入处理
-    elements.urlInput.addEventListener('input', debounce(e => processImage(e.target.value.trim(), "url"), 1000));
-    elements.base64Input.addEventListener('input', debounce(e => processImage(e.target.value.trim(), "base64"), 1500));
+    elements.urlInput.addEventListener('input', debounce(e => {
+        const value = e.target.value.trim();
+        if (value) processImage(value, "url");
+    }, 1000));
+    elements.base64Input.addEventListener('input', debounce(e => {
+        const value = e.target.value.trim();
+        if(value) processImage(value, "base64");
+    }, 1500));
     
     elements.clearAllHistoryBtn.addEventListener('click', async () => {
         if (!confirm('确定要清空所有历史记录吗？此操作将同时清空本地和云端的历史记录，不可恢复。')) return;
@@ -928,7 +1188,7 @@ function getApiDocsHTML() {
         <h2>认证</h2>
         <p>所有API请求都需要通过 <code>Authorization</code> 请求头进行认证。您需要在Cloudflare Worker的设置中配置一个名为 <code>API_KEY</code> 的环境变量作为您的API密钥。</p>
         <div class="alert alert-info">
-            <strong>注意：</strong> 认证密钥必须以 <code>Bearer </code> 为前缀。
+            <strong>注意：</strong> 认证密钥必须以 <code>Bearer </code> 为前缀。此外，使用Gemini模型需要在Cloudflare Worker中额外配置 <code>GEMINI_API_KEY</code> 环境变量。
         </div>
         <h3>请求头示例</h3>
         <pre><code>Authorization: Bearer YOUR_API_KEY</code></pre>
@@ -948,6 +1208,7 @@ function getApiDocsHTML() {
             <pre><code>curl --location --request POST 'https://YOUR_WORKER_URL/api/recognize/url' \\
 --header 'Content-Type: application/json' \\
 --header 'Authorization: Bearer YOUR_API_KEY' \\
+--header 'x-recognition-model: 0' \\
 --data-raw '{
     "imageUrl": "https://i.stack.imgur.com/i23ns.png"
 }'</code></pre>
@@ -965,6 +1226,7 @@ function getApiDocsHTML() {
             <pre><code>curl --location --request POST 'https://YOUR_WORKER_URL/api/recognize/base64' \\
 --header 'Content-Type: application/json' \\
 --header 'Authorization: Bearer YOUR_API_KEY' \\
+--header 'x-recognition-model: 1' \\
 --data-raw '{
     "base64Image": "PASTE_YOUR_BASE64_STRING_HERE"
 }'</code></pre>
@@ -972,20 +1234,25 @@ function getApiDocsHTML() {
 
         <h2>通用参数</h2>
         <h3>可选请求头</h3>
-        <p>您可以通过自定义请求头来启用高级模式并传递自定义Prompt。</p>
+        <p>您可以通过自定义请求头来控制识别行为。</p>
         <table>
             <thead>
                 <tr>
                     <th>Header</th>
                     <th>描述</th>
-                    <th>值示例</th>
+                    <th>值</th>
                 </tr>
             </thead>
             <tbody>
                 <tr>
+                    <td><code>x-recognition-model</code></td>
+                    <td>选择用于识别的AI模型。</td>
+                    <td><code>0</code>: 通义千问 (默认)<br><code>1</code>: Gemini 2.5 flash</td>
+                </tr>
+                <tr>
                     <td><code>x-advanced-mode</code></td>
                     <td>是否启用高级模式。如果为 <code>true</code>，将使用下面的自定义Prompt，否则使用默认Prompt。</td>
-                    <td><code>true</code></td>
+                    <td><code>true</code> 或 <code>false</code></td>
                 </tr>
                 <tr>
                     <td><code>x-custom-prompt</code></td>
