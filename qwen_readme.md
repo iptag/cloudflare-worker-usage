@@ -38,7 +38,7 @@
 1.  一个 Cloudflare 账户。
 2.  开通 Cloudflare Workers 和 KV 存储服务。
 3.  获取通义千问的Cookie。
-    *   登录 [通义千问官网](https://chat.qwen.ai/)。
+    *   必须账号登录 [通义千问官网](https://chat.qwen.ai/)，无账号登录的cookie无法使用。
     *   打开浏览器开发者工具（按F12），切换到“网络(Network)”标签页。
     *   随便发送一条消息，在请求头中找到 `Cookie` 字段，并复制其完整内容。
 
