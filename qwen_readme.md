@@ -51,7 +51,7 @@
 
 2.  **粘贴代码**
     *   部署完成后，点击 "Edit code"。
-    *   将 `worker.js` 文件中的所有代码复制并粘贴到Cloudflare的在线编辑器中，覆盖原有内容。
+    *   将 `qwen.js` 文件中的所有代码复制并粘贴到Cloudflare的在线编辑器中，覆盖原有内容。
     *   点击 "Save and deploy"。
 
 3.  **配置环境变量和密钥**
