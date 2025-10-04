@@ -914,23 +914,25 @@ async function handleChatCompletions(request) {
                 }
 
                 // 提取内容
-                const content = parsed.data?.choices?.[0]?.delta?.content ||
-                               parsed.choices?.[0]?.delta?.content ||
-                               parsed.data?.choices?.[0]?.message?.content ||
-                               parsed.choices?.[0]?.message?.content || '';
-
-                if (content && content.trim()) {
-                  // 对于图片生成（t2i），第一个非空内容通常是图片 URL
-                  // 对于文本对话，累积所有内容
-                  if (chatType === 't2i' || chatType === 't2v') {
-                    // 图片/视频生成：只取第一个非空内容（通常是 URL）
-                    if (!fullContent) {
-                      fullContent = content;
+                let deltaContent = parsed.data?.choices?.[0]?.delta?.content || 
+                                parsed.choices?.[0]?.delta?.content || '';
+                if (deltaContent) {
+                    // 只累加增量内容
+                    if (chatType === 't2i' || chatType === 't2v') {
+                        if (!fullContent) {
+                            fullContent = deltaContent;
+                        }
+                    } else {
+                        fullContent += deltaContent;
                     }
-                  } else {
-                    // 文本对话：累积所有内容
-                    fullContent += content;
-                  }
+                } else {
+                    // 如果没有 deltaContent，再尝试获取一次完整的 message.content
+                    // 这可以作为一种兼容和回退机制
+                    let messageContent = parsed.data?.choices?.[0]?.message?.content ||
+                                        parsed.choices?.[0]?.message?.content || '';
+                    if (messageContent && !fullContent) { // 关键：仅在 fullContent 为空时才赋值
+                        fullContent = messageContent;
+                    }
                 }
               } catch (e) {
                 console.error('解析流式数据失败:', e, '数据:', data.substring(0, 100));
